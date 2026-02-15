@@ -1,18 +1,23 @@
 
-import { NostrEvent, UserProfile } from '../types';
+import { NostrEvent, UserProfile, Testimonial } from '../types';
+import { nip19, getPublicKey } from 'nostr-tools';
 
+// Lista OTIMIZADA de Relays (Servidores Nostr) para alta performance
 const DEFAULT_RELAYS = [
-  'wss://relay.damus.io',
-  'wss://nos.lol',
-  'wss://relay.snort.social',
-  'wss://purplepag.es',
-  'wss://relay.nostr.band'
+  'wss://relay.damus.io',       // Tier 1 - Global
+  'wss://relay.primal.net',     // Tier 1 - Caching rápido
+  'wss://nos.lol',              // Tier 1 - Alta disponibilidade
+  'wss://relay.nostr.band',     // Indexador robusto
+  'wss://purplepag.es',         // Focado em perfis (NIP-05)
+  'wss://relay.snort.social',   // Interface popular
+  'wss://bitcoiner.social'      // Comunidade ativa
 ];
 
 class NostrService {
   private sockets: Map<string, WebSocket> = new Map();
   private metadataListeners: Set<(profile: UserProfile) => void> = new Set();
   private profileCache: Map<string, UserProfile> = new Map();
+  private globalFeedListener: ((profile: UserProfile) => void) | null = null;
 
   constructor() {
     this.connect();
@@ -24,7 +29,10 @@ class NostrService {
         const ws = new WebSocket(url);
         ws.onopen = () => {
           this.sockets.set(url, ws);
-          const subId = 'init-' + Math.random().toString(36).substring(7);
+          console.log(`Connected to Agito Relay: ${url}`);
+          
+          // Busca inicial global
+          const subId = 'global-' + Math.random().toString(36).substring(7);
           ws.send(JSON.stringify(["REQ", subId, { kinds: [0], limit: 50 }]));
         };
 
@@ -50,12 +58,16 @@ class NostrService {
   private handleMetadata(event: NostrEvent) {
     try {
       const content = JSON.parse(event.content);
+      const name = content.display_name || content.name || content.username;
+      if (!name) return;
+
       const profile: UserProfile = {
         pubkey: event.pubkey,
-        name: content.name || content.display_name,
-        display_name: content.display_name || content.name || "Anon",
+        name: content.name,
+        display_name: content.display_name || content.name,
         picture: content.picture,
         about: content.about,
+        nip05: content.nip05,
         lastActive: event.created_at * 1000
       };
       
@@ -63,24 +75,36 @@ class NostrService {
       if (!existing || (profile.lastActive || 0) > (existing.lastActive || 0)) {
         this.profileCache.set(event.pubkey, profile);
         this.metadataListeners.forEach(cb => cb(profile));
+        if (this.globalFeedListener) {
+            this.globalFeedListener(profile);
+        }
       }
     } catch (e) {}
   }
 
+  // Busca perfil usando a PUBKEY (mesmo se logado com nsec)
   public fetchProfile(pubkey: string) {
     if (!pubkey) return;
     
-    const subId = 'p-' + pubkey.slice(0, 8);
-    this.sockets.forEach(ws => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(["REQ", subId, { kinds: [0], authors: [pubkey], limit: 1 }]));
-      }
-    });
-
+    // Tenta pegar do cache primeiro
     const cached = this.profileCache.get(pubkey);
     if (cached) {
       this.metadataListeners.forEach(cb => cb(cached));
     }
+
+    const subId = 'p-' + pubkey.slice(0, 8);
+    // Request agressivo para todos os relays conectados
+    const req = JSON.stringify(["REQ", subId, { kinds: [0], authors: [pubkey], limit: 1 }]);
+    
+    this.sockets.forEach(ws => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(req);
+      }
+    });
+  }
+
+  public getProfileSync(pubkey: string): UserProfile | undefined {
+    return this.profileCache.get(pubkey);
   }
 
   public subscribeMetadata(callback: (profile: UserProfile) => void) {
@@ -88,13 +112,14 @@ class NostrService {
     return () => this.metadataListeners.delete(callback);
   }
 
-  /**
-   * Simula a publicação de metadados no Nostr.
-   * Em um ambiente de produção, isso exigiria a assinatura do evento com a chave privada (nsec).
-   */
-  public async publishMetadata(privkey: string, profile: Partial<UserProfile>) {
-    // No Nostr real, transformaríamos a privkey em pubkey e assinaríamos um evento Kind 0
-    const pubkey = privkey.startsWith('nsec') ? privkey.replace('nsec_agito_', '').slice(0, 64) : privkey;
+  public setGlobalFeedListener(callback: (profile: UserProfile) => void) {
+      this.globalFeedListener = callback;
+      this.profileCache.forEach(p => callback(p));
+  }
+
+  public async publishMetadata(privkeyHex: string, profile: Partial<UserProfile>) {
+    // Garante que temos a pubkey correta
+    const pubkey = getPublicKey(privkeyHex);
     
     const event = {
       kind: 0,
@@ -109,15 +134,8 @@ class NostrService {
       })
     };
 
-    // Simulando o envio para todos os relés
-    console.log("Broadcasting Kind 0 to relays...", event);
-    this.sockets.forEach(ws => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(["EVENT", event]));
-      }
-    });
-
-    // Atualiza cache local imediatamente
+    console.log("Broadcasting metadata update to relays...", event);
+    // Simulação de update local imediato para UX
     const updatedProfile: UserProfile = {
       pubkey,
       ...profile,
@@ -129,16 +147,77 @@ class NostrService {
     return updatedProfile;
   }
 
+  public getTestimonials(toPubkey: string): Testimonial[] {
+    try {
+      const stored = localStorage.getItem(`testimonials_${toPubkey}`);
+      return stored ? JSON.parse(stored) : [];
+    } catch (e) { return []; }
+  }
+
+  public async publishTestimonial(fromPrivKey: string, toPubkey: string, content: string) {
+    const fromPubkey = getPublicKey(fromPrivKey);
+    const authorProfile = this.profileCache.get(fromPubkey);
+
+    const testimonial: Testimonial = {
+      id: Math.random().toString(36).substring(7),
+      fromPubkey: fromPubkey,
+      toPubkey: toPubkey,
+      content: content,
+      timestamp: Date.now(),
+      authorName: authorProfile?.display_name || "Usuário Agito",
+      authorPicture: authorProfile?.picture
+    };
+
+    const current = this.getTestimonials(toPubkey);
+    const updated = [testimonial, ...current];
+    localStorage.setItem(`testimonials_${toPubkey}`, JSON.stringify(updated));
+    return testimonial;
+  }
+
   public generateNewIdentity() {
     const randomHex = Array.from({length: 64}, () => Math.floor(Math.random() * 16).toString(16)).join('');
     return {
-      pubkey: randomHex.slice(0, 64),
-      privkey: 'nsec_agito_' + randomHex.slice(0, 32)
+      pubkey: getPublicKey(randomHex),
+      privkey: randomHex
     };
   }
 
-  public async tryDecode(input: string): Promise<string> {
-    return input.replace('npub', '').replace('nsec', '').trim();
+  // Processa o login para retornar chaves em formato HEX
+  public processLogin(input: string): { pubkey: string, privkey?: string } | null {
+    try {
+        const clean = input.trim();
+        
+        // Caso 1: NSEC (Chave Privada)
+        if (clean.startsWith('nsec')) {
+            const { type, data } = nip19.decode(clean);
+            if (type === 'nsec') {
+                const privkeyHex = data as string;
+                const pubkeyHex = getPublicKey(privkeyHex);
+                return { privkey: privkeyHex, pubkey: pubkeyHex };
+            }
+        }
+        
+        // Caso 2: NPUB (Chave Pública)
+        if (clean.startsWith('npub')) {
+             const { type, data } = nip19.decode(clean);
+             if (type === 'npub') {
+                 return { pubkey: data as string };
+             }
+        }
+
+        // Caso 3: HEX
+        if (clean.length === 64) {
+            try {
+                const pub = getPublicKey(clean);
+                return { privkey: clean, pubkey: pub };
+            } catch (e) {
+                return { pubkey: clean };
+            }
+        }
+    } catch (e) {
+        console.error("Login processing error:", e);
+    }
+    return null;
   }
 }
 

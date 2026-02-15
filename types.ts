@@ -17,6 +17,10 @@ export interface UserProfile {
   picture?: string;
   nip05?: string;
   lastActive?: number;
+  // Campos inferidos para o sistema de Match do Agito
+  inferredLocation?: 'BR' | 'GLOBAL';
+  inferredGender?: 'male' | 'female';
+  inferredAge?: number;
 }
 
 export interface FeedPost extends NostrEvent {
@@ -39,6 +43,23 @@ export interface Report {
   timestamp: number;
   chatHistory: ChatMessage[];
   reason: string;
+}
+
+export interface Testimonial {
+  id: string;
+  fromPubkey: string;
+  toPubkey: string;
+  content: string;
+  timestamp: number;
+  authorName?: string;
+  authorPicture?: string;
+}
+
+export interface MatchFilters {
+  location: 'BR' | 'GLOBAL';
+  gender: 'all' | 'male' | 'female';
+  ageMin: number;
+  ageMax: number;
 }
 
 export enum AppRoute {
